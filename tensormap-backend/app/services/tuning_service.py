@@ -11,12 +11,13 @@ Progress is emitted via Socket.IO to a ``tuning:{session_id}`` room.
 
 import asyncio
 import itertools
+import math
 import os
 import threading
 from datetime import UTC, datetime
 
 import numpy as np
-from sqlalchemy import func
+from sqlalchemy import func, update
 from sqlmodel import Session, select
 
 from app.database import engine
@@ -69,6 +70,28 @@ def check_tuning_concurrency_limit(session: Session) -> None:
             429,
             f"Max concurrent tuning sessions reached ({MAX_CONCURRENT_TUNING_SESSIONS}). Try again shortly.",
         )
+
+
+def resolve_trial_metric(session: Session, job_id: str, metric_name: str) -> float | None:
+    """Read the final finite value of ``metric_name`` for a trial job.
+
+    Falls back to the corresponding ``val_``-prefixed or unprefixed variant only
+    when no row exists for ``metric_name``. Ignores non-finite values (NaN/Inf)
+    so diverged metrics never poison tuning selection or JSON serialization.
+    """
+    alt_name = metric_name.removeprefix("val_") if metric_name.startswith("val_") else f"val_{metric_name}"
+    for candidate_name in (metric_name, alt_name):
+        row = session.exec(
+            select(TrainingMetric)
+            .where(TrainingMetric.job_id == job_id, TrainingMetric.metric_name == candidate_name)
+            .order_by(TrainingMetric.epoch.desc())
+            .limit(1)
+        ).first()
+        if row is not None:
+            if row.metric_value is None or not math.isfinite(row.metric_value):
+                return None
+            return float(row.metric_value)
+    return None
 
 
 class TuningService:
@@ -192,7 +215,7 @@ class TuningService:
         Runs synchronously in the tuning background thread.
         """
         from app.services.model_run import model_run
-        from app.services.training_service import create_training_job, update_job_status
+        from app.services.training_service import create_training_job
 
         with make_session() as session:
             model = session.exec(select(ModelBasic).where(ModelBasic.model_name == model_name)).first()
@@ -220,7 +243,20 @@ class TuningService:
         except Exception as e:
             logger.error("Trial %d failed for tuning session %s: %s", trial_num, session_id, e)
             with make_session() as session:
-                update_job_status(job_id, TrainingStatus.FAILED, session, error_message=str(e))
+                session.exec(
+                    update(TrainingJob)
+                    .where(
+                        TrainingJob.id == job_id,
+                        TrainingJob.status.in_((TrainingStatus.PENDING, TrainingStatus.RUNNING)),
+                    )
+                    .values(
+                        status=TrainingStatus.FAILED,
+                        completed_at=_utcnow(),
+                        error_message=str(e)[:2000],
+                    )
+                )
+                session.commit()
+                session.expire_all()
         finally:
             timer.cancel()
 
@@ -268,41 +304,32 @@ class TuningService:
     def _timeout_trial(self, job_id: str) -> None:
         """Called by ``threading.Timer`` if a trial exceeds the timeout.
 
-        Sets the job's DB status to CANCELLED so ``CancellationCheckCallback``
-        stops the Keras loop at the next epoch boundary.
+        Atomically transitions only active (PENDING/RUNNING) jobs to CANCELLED
+        so a late timeout never overwrites COMPLETED, FAILED, or already
+        CANCELLED trial states or their completion metadata.
         """
-        logger.warning("Trial timeout exceeded for job %s", job_id)
-        from app.services.training_service import update_job_status
-
         with make_session() as session:
-            update_job_status(job_id, TrainingStatus.CANCELLED, session, error_message="Trial timeout exceeded")
+            res = session.exec(
+                update(TrainingJob)
+                .where(
+                    TrainingJob.id == job_id,
+                    TrainingJob.status.in_((TrainingStatus.PENDING, TrainingStatus.RUNNING)),
+                )
+                .values(
+                    status=TrainingStatus.CANCELLED,
+                    completed_at=_utcnow(),
+                    error_message="Trial timeout exceeded",
+                )
+            )
+            session.commit()
+            session.expire_all()
+        if res.rowcount == 1:
+            logger.warning("Trial timeout exceeded for job %s", job_id)
 
     def _get_trial_metric(self, job_id: str, metric_name: str) -> float | None:
-        """Read the final (last epoch) value of ``metric_name`` for a job.
-
-        Falls back to common metric name variants (e.g. accuracy vs val_accuracy).
-        Returns None if no metrics are recorded.
-        """
+        """Read the final finite value of ``metric_name`` for a job."""
         with make_session() as session:
-            # Try the exact metric name first.
-            row = session.exec(
-                select(TrainingMetric)
-                .where(TrainingMetric.job_id == job_id, TrainingMetric.metric_name == metric_name)
-                .order_by(TrainingMetric.epoch.desc())
-                .limit(1)
-            ).first()
-            if row is not None:
-                return row.metric_value
-
-            # Fallback: try without the "val_" prefix or with it.
-            alt_name = metric_name.replace("val_", "") if metric_name.startswith("val_") else f"val_{metric_name}"
-            row = session.exec(
-                select(TrainingMetric)
-                .where(TrainingMetric.job_id == job_id, TrainingMetric.metric_name == alt_name)
-                .order_by(TrainingMetric.epoch.desc())
-                .limit(1)
-            ).first()
-            return row.metric_value if row is not None else None
+            return resolve_trial_metric(session, job_id, metric_name)
 
     # ------------------------------------------------------------------
     # Main tuning loop
@@ -332,30 +359,40 @@ class TuningService:
         except Exception:  # noqa: BLE001
             logger.warning("Failed to emit tuning progress for session %s", session_id)
 
+    def _is_session_running(self, session_id: str) -> bool:
+        """Return True while the tuning session exists and remains in RUNNING."""
+        with make_session() as session:
+            ts = session.get(TuningSession, session_id)
+            return ts is not None and ts.status == TuningStatus.RUNNING
+
     def _fail_tuning_session(
         self, session_id: str, loop: asyncio.AbstractEventLoop, message: str | None = None
     ) -> None:
-        """Mark a tuning session as FAILED and emit a completion event.
+        """Mark an active tuning session as FAILED and emit a completion event.
 
-        Ensures a session can never be left stuck in ``RUNNING`` with no
-        completion event when an unrecoverable error occurs.
+        Uses a conditional transition from PENDING/RUNNING so CANCELLED or
+        COMPLETED sessions (and their completion timestamps) are never
+        overwritten and never emit duplicate terminal events.
         """
         with make_session() as session:
-            ts = session.get(TuningSession, session_id)
-            if ts is None:
-                return
-            if ts.status != TuningStatus.CANCELLED:
-                ts.status = TuningStatus.FAILED
-            ts.completed_at = _utcnow()
-            session.add(ts)
+            res = session.exec(
+                update(TuningSession)
+                .where(
+                    TuningSession.id == session_id,
+                    TuningSession.status.in_((TuningStatus.PENDING, TuningStatus.RUNNING)),
+                )
+                .values(status=TuningStatus.FAILED, completed_at=_utcnow())
+            )
             session.commit()
-            final_status = ts.status.value
+            session.expire_all()
+            if res.rowcount == 0:
+                return
         self._emit_progress(
             loop,
             session_id,
             {
                 "type": "tuning_complete",
-                "status": final_status,
+                "status": TuningStatus.FAILED.value,
                 "best_job_id": None,
                 "best_metric": None,
                 "error": message,
@@ -373,15 +410,27 @@ class TuningService:
         Generates trial combinations, executes each one, emits progress,
         and handles early stopping and cancellation.
         """
-        # Load session.
+        # Atomically claim PENDING -> RUNNING so a session cancelled before the
+        # worker starts is never revived into RUNNING.
         with make_session() as session:
+            claim = session.exec(
+                update(TuningSession)
+                .where(TuningSession.id == session_id, TuningSession.status == TuningStatus.PENDING)
+                .values(status=TuningStatus.RUNNING)
+            )
+            session.commit()
+            session.expire_all()
             tuning_session = session.get(TuningSession, session_id)
             if tuning_session is None:
                 logger.error("Tuning session %s not found", session_id)
                 return
-            tuning_session.status = TuningStatus.RUNNING
-            session.add(tuning_session)
-            session.commit()
+            if claim.rowcount == 0:
+                logger.info(
+                    "Tuning session %s is already %s; skipping tuning loop",
+                    session_id,
+                    tuning_session.status.value,
+                )
+                return
 
             strategy = tuning_session.strategy
             search_space = tuning_session.search_space
@@ -390,132 +439,167 @@ class TuningService:
             direction = tuning_session.direction
             early_stop_threshold = tuning_session.early_stop_threshold
 
-        # Validate the search space defensively so a malformed row can never
-        # crash the loop below and leave the session stuck in RUNNING.
         try:
-            self.validate_search_space(search_space, strategy)
-        except AppException as e:
-            logger.error("Tuning session %s has an invalid search space: %s", session_id, e.detail)
-            self._fail_tuning_session(session_id, loop, str(e.detail))
-            return
-
-        # Generate trial combinations.
-        if strategy == TuningStrategy.GRID:
-            trials = self.generate_grid_combinations(search_space)
-        else:
-            rng = np.random.default_rng(seed=42)
-            trials = [self.sample_random_combination(search_space, rng) for _ in range(max_trials)]
-
-        # Update total trials.
-        with make_session() as session:
-            ts = session.get(TuningSession, session_id)
-            ts.total_trials = len(trials)
-            session.add(ts)
-            session.commit()
-
-        best_metric: float | None = None
-        best_job_id: str | None = None
-
-        for trial_num, hyperparams in enumerate(trials):
-            # Check for cancellation.
-            with make_session() as session:
-                ts = session.get(TuningSession, session_id)
-                if ts.status == TuningStatus.CANCELLED:
-                    logger.info("Tuning session %s was cancelled, stopping", session_id)
-                    break
-
-            # Run the trial.
+            # Validate the search space defensively so a malformed row can never
+            # crash the loop below and leave the session stuck in RUNNING.
             try:
-                job_id = self._run_single_trial(session_id, model_name, hyperparams, trial_num, loop)
-            except Exception as e:
-                logger.error("Trial %d failed: %s", trial_num, e)
-                # Update completed count even on failure.
-                with make_session() as session:
-                    ts = session.get(TuningSession, session_id)
-                    ts.completed_trials += 1
-                    session.add(ts)
-                    session.commit()
-                continue
+                self.validate_search_space(search_space, strategy)
+            except AppException as e:
+                logger.error("Tuning session %s has an invalid search space: %s", session_id, e.detail)
+                self._fail_tuning_session(session_id, loop, str(e.detail))
+                return
 
-            # Get the trial's target metric value.
-            final_metric = self._get_trial_metric(job_id, metric)
+            # Generate trial combinations.
+            if strategy == TuningStrategy.GRID:
+                trials = self.generate_grid_combinations(search_space)
+            else:
+                rng = np.random.default_rng(seed=42)
+                trials = [self.sample_random_combination(search_space, rng) for _ in range(max_trials)]
 
-            # Update best.
-            if final_metric is not None and (
-                best_metric is None
-                or (direction == "maximize" and final_metric > best_metric)
-                or (direction == "minimize" and final_metric < best_metric)
-            ):
-                best_metric = final_metric
-                best_job_id = job_id
-
-            # Update session progress.
+            # Update total trials unless cancelled meanwhile.
             with make_session() as session:
                 ts = session.get(TuningSession, session_id)
-                ts.completed_trials += 1
-                if best_job_id is not None:
-                    ts.best_job_id = best_job_id
+                if ts is None or ts.status != TuningStatus.RUNNING:
+                    logger.info("Tuning session %s no longer running before loop start; exiting", session_id)
+                    return
+                ts.total_trials = len(trials)
                 session.add(ts)
                 session.commit()
 
-            # Emit progress.
-            self._emit_progress(
-                loop,
-                session_id,
-                {
-                    "type": "tuning_progress",
-                    "trial": trial_num + 1,
-                    "total": len(trials),
-                    "job_id": job_id,
-                    "hyperparams": hyperparams,
-                    "metric": final_metric,
-                    "best_metric": best_metric,
-                    "best_job_id": best_job_id,
-                },
-            )
+            best_metric: float | None = None
+            best_job_id: str | None = None
 
-            # Early stopping check.
-            if early_stop_threshold is not None and final_metric is not None:
-                should_stop = (direction == "maximize" and final_metric >= early_stop_threshold) or (
-                    direction == "minimize" and final_metric <= early_stop_threshold
-                )
-                if should_stop:
-                    logger.info(
-                        "Early stopping triggered for session %s: metric=%s threshold=%s",
-                        session_id,
-                        final_metric,
-                        early_stop_threshold,
-                    )
-                    with make_session() as session:
-                        ts = session.get(TuningSession, session_id)
-                        ts.early_stopped = True
-                        session.add(ts)
-                        session.commit()
+            for trial_num, hyperparams in enumerate(trials):
+                if not self._is_session_running(session_id):
+                    logger.info("Tuning session %s was cancelled, stopping", session_id)
                     break
 
-        # Mark session complete (unless cancelled).
-        with make_session() as session:
-            ts = session.get(TuningSession, session_id)
-            if ts.status != TuningStatus.CANCELLED:
-                ts.status = TuningStatus.COMPLETED
-            ts.completed_at = _utcnow()
-            if best_job_id is not None:
-                ts.best_job_id = best_job_id
-            session.add(ts)
-            session.commit()
-            final_status = ts.status.value
+                # Run the trial.
+                try:
+                    job_id = self._run_single_trial(session_id, model_name, hyperparams, trial_num, loop)
+                except Exception as e:
+                    logger.error("Trial %d failed: %s", trial_num, e)
+                    if not self._is_session_running(session_id):
+                        logger.info("Tuning session %s was cancelled during failed trial, stopping", session_id)
+                        break
+                    # Update completed count even on failure.
+                    with make_session() as session:
+                        ts = session.get(TuningSession, session_id)
+                        if ts is None or ts.status != TuningStatus.RUNNING:
+                            break
+                        ts.completed_trials += 1
+                        session.add(ts)
+                        session.commit()
+                    continue
 
-        # Emit completion event.
-        self._emit_progress(
-            loop,
-            session_id,
-            {
-                "type": "tuning_complete",
-                "status": final_status,
-                "best_job_id": best_job_id,
-                "best_metric": best_metric,
-            },
-        )
+                # Recheck cancellation immediately after each trial before scoring or emitting progress.
+                if not self._is_session_running(session_id):
+                    logger.info("Tuning session %s was cancelled during trial %d, stopping", session_id, trial_num)
+                    break
+
+                with make_session() as session:
+                    job = session.get(TrainingJob, job_id)
+                    trial_completed = job is not None and job.status == TrainingStatus.COMPLETED
+
+                # Only COMPLETED trials with finite metrics can become best_job_id or trigger early stopping.
+                final_metric = self._get_trial_metric(job_id, metric) if trial_completed else None
+                if final_metric is not None and not math.isfinite(final_metric):
+                    final_metric = None
+
+                # Update best.
+                if final_metric is not None and (
+                    best_metric is None
+                    or (direction == "maximize" and final_metric > best_metric)
+                    or (direction == "minimize" and final_metric < best_metric)
+                ):
+                    best_metric = final_metric
+                    best_job_id = job_id
+
+                # Update session progress.
+                with make_session() as session:
+                    ts = session.get(TuningSession, session_id)
+                    if ts is None or ts.status != TuningStatus.RUNNING:
+                        logger.info("Tuning session %s no longer running during progress update, stopping", session_id)
+                        break
+                    ts.completed_trials += 1
+                    if best_job_id is not None:
+                        ts.best_job_id = best_job_id
+                    session.add(ts)
+                    session.commit()
+
+                # Emit progress.
+                self._emit_progress(
+                    loop,
+                    session_id,
+                    {
+                        "type": "tuning_progress",
+                        "trial": trial_num + 1,
+                        "total": len(trials),
+                        "job_id": job_id,
+                        "hyperparams": hyperparams,
+                        "metric": final_metric,
+                        "best_metric": best_metric,
+                        "best_job_id": best_job_id,
+                    },
+                )
+
+                # Early stopping check.
+                if early_stop_threshold is not None and final_metric is not None:
+                    should_stop = (direction == "maximize" and final_metric >= early_stop_threshold) or (
+                        direction == "minimize" and final_metric <= early_stop_threshold
+                    )
+                    if should_stop:
+                        logger.info(
+                            "Early stopping triggered for session %s: metric=%s threshold=%s",
+                            session_id,
+                            final_metric,
+                            early_stop_threshold,
+                        )
+                        with make_session() as session:
+                            ts = session.get(TuningSession, session_id)
+                            if ts is None or ts.status != TuningStatus.RUNNING:
+                                break
+                            ts.early_stopped = True
+                            session.add(ts)
+                            session.commit()
+                        break
+
+            # Transition only RUNNING -> COMPLETED so concurrent cancel_tuning stays
+            # CANCELLED and retains sole ownership of the cancellation terminal emit.
+            completion_values: dict = {
+                "status": TuningStatus.COMPLETED,
+                "completed_at": _utcnow(),
+            }
+            if best_job_id is not None:
+                completion_values["best_job_id"] = best_job_id
+
+            with make_session() as session:
+                res = session.exec(
+                    update(TuningSession)
+                    .where(TuningSession.id == session_id, TuningSession.status == TuningStatus.RUNNING)
+                    .values(**completion_values)
+                )
+                session.commit()
+                session.expire_all()
+                transitioned_to_completed = res.rowcount == 1
+
+            if transitioned_to_completed:
+                self._emit_progress(
+                    loop,
+                    session_id,
+                    {
+                        "type": "tuning_complete",
+                        "status": TuningStatus.COMPLETED.value,
+                        "best_job_id": best_job_id,
+                        "best_metric": best_metric,
+                    },
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Tuning session %s failed unexpectedly: %s", session_id, e)
+            try:
+                self._fail_tuning_session(session_id, loop, str(e))
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to transition tuning session %s to FAILED after error", session_id)
 
     # ------------------------------------------------------------------
     # Duration estimation
@@ -554,11 +638,17 @@ class TuningService:
             ts = session.get(TuningSession, session_id)
             if ts is None:
                 raise AppException(404, "Tuning session not found")
+            if ts.status != TuningStatus.COMPLETED:
+                raise AppException(400, "Tuning session is not completed yet")
             if ts.best_job_id is None:
                 raise AppException(400, "No best trial found for this tuning session")
 
             best_job = session.get(TrainingJob, ts.best_job_id)
-            if best_job is None or best_job.hyperparams is None:
+            if best_job is None:
+                raise AppException(400, "Best trial job not found")
+            if best_job.status != TrainingStatus.COMPLETED:
+                raise AppException(400, "Best trial is not completed")
+            if best_job.hyperparams is None:
                 raise AppException(400, "Best trial has no hyperparams")
 
             model = session.get(ModelBasic, ts.model_id)

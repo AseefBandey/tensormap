@@ -10,17 +10,22 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse, Response
+from sqlalchemy import update
 from sqlmodel import Session, select
 
 from app.database import get_db
 from app.exceptions import AppException
 from app.models.ml import ModelBasic
 from app.models.training_job import TrainingJob, TrainingStatus
-from app.models.training_metric import TrainingMetric
 from app.models.tuning_session import TuningSession, TuningStatus, TuningStrategy
 from app.schemas.tuning import TuningStartRequest
 from app.services.training_service import update_job_status
-from app.services.tuning_service import check_tuning_concurrency_limit, launch_tuning_session, tuning_service
+from app.services.tuning_service import (
+    check_tuning_concurrency_limit,
+    launch_tuning_session,
+    resolve_trial_metric,
+    tuning_service,
+)
 from app.shared.constants import SOCKETIO_DL_NAMESPACE, SOCKETIO_LISTENER
 from app.shared.logging_config import get_logger
 from app.shared.training_events import training_event
@@ -129,17 +134,8 @@ def get_tuning_session(tuning_id: str, db: Session = Depends(get_db)) -> JSONRes
 
     trial_data = []
     for job in trials:
-        # Get the target metric for this job.
-        metric_val = None
-        if job.status.value == "completed":
-            row = db.exec(
-                select(TrainingMetric)
-                .where(TrainingMetric.job_id == job.id, TrainingMetric.metric_name == ts.metric)
-                .order_by(TrainingMetric.epoch.desc())
-                .limit(1)
-            ).first()
-            if row:
-                metric_val = row.metric_value
+        # Only expose metrics for completed trials using consistent fallback resolution.
+        metric_val = resolve_trial_metric(db, job.id, ts.metric) if job.status == TrainingStatus.COMPLETED else None
 
         trial_data.append(
             {
@@ -194,12 +190,20 @@ async def cancel_tuning(tuning_id: str, db: Session = Depends(get_db)) -> Respon
     if ts is None:
         raise AppException(404, "Tuning session not found")
 
-    if ts.status in (TuningStatus.PENDING, TuningStatus.RUNNING):
-        now = datetime.now(UTC)
-        ts.status = TuningStatus.CANCELLED
-        ts.completed_at = now
-        db.add(ts)
-        db.commit()
+    # Atomically claim PENDING/RUNNING -> CANCELLED so concurrent DELETE
+    # requests cannot both emit a terminal cancellation event.
+    res = db.exec(
+        update(TuningSession)
+        .where(
+            TuningSession.id == tuning_id,
+            TuningSession.status.in_((TuningStatus.PENDING, TuningStatus.RUNNING)),
+        )
+        .values(status=TuningStatus.CANCELLED, completed_at=datetime.now(UTC))
+    )
+    db.commit()
+    db.expire_all()
+
+    if res.rowcount == 1:
         logger.info("Cancellation requested for tuning session %s", tuning_id)
 
         # Also cancel any currently running trial jobs.
@@ -221,16 +225,7 @@ async def cancel_tuning(tuning_id: str, db: Session = Depends(get_db)) -> Respon
             except Exception:
                 logger.warning("Failed to emit cancellation event to room for job %s", job.id)
 
-        best_metric = None
-        if ts.best_job_id:
-            row = db.exec(
-                select(TrainingMetric)
-                .where(TrainingMetric.job_id == ts.best_job_id, TrainingMetric.metric_name == ts.metric)
-                .order_by(TrainingMetric.epoch.desc())
-                .limit(1)
-            ).first()
-            if row:
-                best_metric = row.metric_value
+        best_metric = resolve_trial_metric(db, ts.best_job_id, ts.metric) if ts.best_job_id else None
 
         try:
             await sio.emit(

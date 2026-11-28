@@ -85,37 +85,28 @@ def _load_tuning_catchup(tuning_id: str) -> dict | None:
     Returns None if the session does not exist.  Runs in a worker thread
     because the DB layer is synchronous.
     """
-    from app.models.training_job import TrainingJob
-    from app.models.training_metric import TrainingMetric
+    from sqlmodel import select
+
+    from app.models.training_job import TrainingJob, TrainingStatus
     from app.models.tuning_session import TuningSession
     from app.services.training_service import make_session
+    from app.services.tuning_service import resolve_trial_metric
 
     with make_session() as session:
         ts = session.get(TuningSession, tuning_id)
         if ts is None:
             return None
 
-        # Gather completed trials.
-        from sqlmodel import select
-
+        # Gather trial summaries using consistent metric resolution.
         jobs = session.exec(
             select(TrainingJob).where(TrainingJob.tuning_session_id == tuning_id).order_by(TrainingJob.started_at)
         ).all()
 
         trials = []
         for job in jobs:
-            metric_val = None
-            row = session.exec(
-                select(TrainingMetric)
-                .where(
-                    TrainingMetric.job_id == job.id,
-                    TrainingMetric.metric_name == ts.metric,
-                )
-                .order_by(TrainingMetric.epoch.desc())
-                .limit(1)
-            ).first()
-            if row:
-                metric_val = row.metric_value
+            metric_val = (
+                resolve_trial_metric(session, job.id, ts.metric) if job.status == TrainingStatus.COMPLETED else None
+            )
             trials.append(
                 {
                     "job_id": job.id,

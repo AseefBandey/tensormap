@@ -1006,3 +1006,747 @@ class TestTuningConcurrencyLimit:
 
         assert exc_info.value.status_code == 429
         assert "Max concurrent tuning sessions reached (1)" in str(exc_info.value.detail)
+
+
+class TestStageATuningStateMachine:
+    """Stage A regression tests for tuning state transitions and exactly-once terminal events."""
+
+    @staticmethod
+    def _patch_make_session(monkeypatch, db_session):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _mock_session_cm():
+            yield db_session
+
+        monkeypatch.setattr("app.services.tuning_service.make_session", _mock_session_cm)
+
+    def test_cancelled_pending_session_never_transitions_to_running(self, db_session, monkeypatch):
+        """A PENDING session cancelled before the worker starts stays CANCELLED and runs no trials."""
+        self._patch_make_session(monkeypatch, db_session)
+        model = _seed_model(db_session, "cancel_pending_model")
+        ts = _seed_tuning_session(
+            db_session,
+            model.id,
+            strategy=TuningStrategy.GRID,
+            status=TuningSessionStatus.CANCELLED,
+            search_space={"optimizer": ["adam", "sgd"]},
+        )
+
+        emitted = []
+        trial_calls = []
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService._emit_progress",
+            lambda _self, _loop, _sid, data: emitted.append(data),
+        )
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService._run_single_trial",
+            lambda _self, *a, **k: trial_calls.append(a) or "unused-job",
+        )
+
+        TuningService().run_tuning_loop(ts.id, model.model_name, loop=None)
+
+        db_session.refresh(ts)
+        assert ts.status == TuningSessionStatus.CANCELLED
+        assert trial_calls == []
+        assert emitted == []
+
+    def test_cancellation_during_trial_stops_without_scoring_or_duplicate_complete(
+        self, client, db_session, monkeypatch
+    ):
+        """Cancelling via DELETE mid-trial skips scoring/early-stop and emits tuning_complete only once."""
+        self._patch_make_session(monkeypatch, db_session)
+        model = _seed_model(db_session, "cancel_mid_trial_model")
+        ts = TuningSession(
+            model_id=model.id,
+            strategy=TuningStrategy.GRID,
+            search_space={"optimizer": ["adam", "sgd"]},
+            max_trials=2,
+            metric="val_accuracy",
+            direction="maximize",
+            early_stop_threshold=0.5,
+            total_trials=2,
+            status=TuningSessionStatus.PENDING,
+        )
+        db_session.add(ts)
+        db_session.commit()
+        db_session.refresh(ts)
+
+        emitted_events = []
+
+        def _record_loop_emit(_self, _loop, _sid, data):
+            emitted_events.append(("loop", data))
+
+        async def _record_router_emit(event_name, payload, **_kwargs):
+            if event_name == "tuning_progress":
+                emitted_events.append(("router", payload))
+
+        monkeypatch.setattr("app.services.tuning_service.TuningService._emit_progress", _record_loop_emit)
+        monkeypatch.setattr("app.routers.tuning.sio.emit", _record_router_emit)
+
+        trial_runs = []
+
+        def _run_and_cancel(_self, session_id, _model_name, _hp, trial_num, _loop):
+            trial_runs.append(trial_num)
+            job = _seed_job(
+                db_session,
+                model.id,
+                TrainingStatus.COMPLETED,
+                hyperparams=_hp,
+                tuning_session_id=session_id,
+            )
+            db_session.add(TrainingMetric(job_id=job.id, epoch=1, metric_name="val_accuracy", metric_value=0.95))
+            db_session.commit()
+            # Simulate user calling DELETE /tuning/{id} while trial 0 is running.
+            resp = client.delete(f"{BASE}/tuning/{session_id}")
+            assert resp.status_code == 204
+            return job.id
+
+        monkeypatch.setattr("app.services.tuning_service.TuningService._run_single_trial", _run_and_cancel)
+
+        TuningService().run_tuning_loop(ts.id, model.model_name, loop=None)
+
+        db_session.refresh(ts)
+        assert trial_runs == [0]  # Trial 1 never starts
+        assert ts.status == TuningSessionStatus.CANCELLED
+        assert ts.completed_trials == 0
+        assert ts.best_job_id is None
+        assert ts.early_stopped is False
+
+        terminal_events = [e for e in emitted_events if e[1].get("type") == "tuning_complete"]
+        assert len(terminal_events) == 1
+        assert terminal_events[0] == (
+            "router",
+            {
+                "type": "tuning_complete",
+                "status": "cancelled",
+                "best_job_id": None,
+                "best_metric": None,
+            },
+        )
+        assert [e for e in emitted_events if e[1].get("type") == "tuning_progress"] == []
+
+    def test_concurrent_cancel_requests_emit_tuning_complete_once(self, client, db_session):
+        """Calling DELETE twice on an active session emits tuning_complete only on the first transition."""
+        model = _seed_model(db_session, "double_cancel_model")
+        ts = _seed_tuning_session(db_session, model.id, status=TuningSessionStatus.RUNNING)
+
+        with patch("app.socketio_instance.sio.emit", new_callable=AsyncMock) as mock_sio_emit:
+            resp1 = client.delete(f"{BASE}/tuning/{ts.id}")
+            resp2 = client.delete(f"{BASE}/tuning/{ts.id}")
+
+        assert resp1.status_code == 204
+        assert resp2.status_code == 204
+        mock_sio_emit.assert_awaited_once()
+
+    def test_fail_tuning_session_preserves_cancelled_and_completed_states(self, db_session, monkeypatch):
+        """_fail_tuning_session never overwrites CANCELLED or COMPLETED sessions or their timestamps."""
+        self._patch_make_session(monkeypatch, db_session)
+        model = _seed_model(db_session, "terminal_guard_model")
+        cancelled_at = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        completed_at = datetime(2026, 1, 1, 13, 0, 0, tzinfo=UTC)
+
+        ts_cancelled = _seed_tuning_session(db_session, model.id, status=TuningSessionStatus.CANCELLED)
+        ts_cancelled.completed_at = cancelled_at
+        ts_completed = _seed_tuning_session(db_session, model.id, status=TuningSessionStatus.COMPLETED)
+        ts_completed.completed_at = completed_at
+        db_session.add(ts_cancelled)
+        db_session.add(ts_completed)
+        db_session.commit()
+
+        emitted = []
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService._emit_progress",
+            lambda _self, _loop, _sid, data: emitted.append(data),
+        )
+
+        svc = TuningService()
+        svc._fail_tuning_session(ts_cancelled.id, loop=None, message="late error")
+        svc._fail_tuning_session(ts_completed.id, loop=None, message="late error")
+
+        db_session.refresh(ts_cancelled)
+        db_session.refresh(ts_completed)
+        assert ts_cancelled.status == TuningSessionStatus.CANCELLED
+        assert ts_cancelled.completed_at.replace(tzinfo=None) == cancelled_at.replace(tzinfo=None)
+        assert ts_completed.status == TuningSessionStatus.COMPLETED
+        assert ts_completed.completed_at.replace(tzinfo=None) == completed_at.replace(tzinfo=None)
+        assert emitted == []
+
+    def test_normal_completion_emits_tuning_complete_exactly_once(self, db_session, monkeypatch):
+        """Happy-path run transitions PENDING -> RUNNING -> COMPLETED and emits tuning_complete once."""
+        self._patch_make_session(monkeypatch, db_session)
+        model = _seed_model(db_session, "happy_tuning_model")
+        ts = TuningSession(
+            model_id=model.id,
+            strategy=TuningStrategy.GRID,
+            search_space={"optimizer": ["adam", "sgd"]},
+            max_trials=2,
+            metric="val_accuracy",
+            direction="maximize",
+            total_trials=2,
+            status=TuningSessionStatus.PENDING,
+        )
+        db_session.add(ts)
+        db_session.commit()
+        db_session.refresh(ts)
+
+        emitted = []
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService._emit_progress",
+            lambda _self, _loop, _sid, data: emitted.append(data),
+        )
+
+        created_jobs = []
+
+        def _fake_trial(_self, session_id, _model_name, hp, trial_num, _loop):
+            job = _seed_job(
+                db_session,
+                model.id,
+                TrainingStatus.COMPLETED,
+                hyperparams=hp,
+                tuning_session_id=session_id,
+            )
+            db_session.add(
+                TrainingMetric(
+                    job_id=job.id,
+                    epoch=1,
+                    metric_name="val_accuracy",
+                    metric_value=0.70 + trial_num * 0.15,
+                )
+            )
+            db_session.commit()
+            created_jobs.append(job.id)
+            return job.id
+
+        monkeypatch.setattr("app.services.tuning_service.TuningService._run_single_trial", _fake_trial)
+
+        TuningService().run_tuning_loop(ts.id, model.model_name, loop=None)
+
+        db_session.refresh(ts)
+        assert ts.status == TuningSessionStatus.COMPLETED
+        assert ts.completed_trials == 2
+        assert ts.best_job_id == created_jobs[1]
+        assert ts.completed_at is not None
+
+        terminal_events = [e for e in emitted if e.get("type") == "tuning_complete"]
+        assert len(terminal_events) == 1
+        assert terminal_events[0]["status"] == "completed"
+        assert terminal_events[0]["best_job_id"] == created_jobs[1]
+        assert terminal_events[0]["best_metric"] == 0.85
+
+
+class TestStageBTrialIntegrity:
+    """Stage B regression tests for trial eligibility, timeouts, metric fallback, and non-finite guards."""
+
+    @staticmethod
+    def _patch_make_session(monkeypatch, db_session):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _mock_session_cm():
+            yield db_session
+
+        monkeypatch.setattr("app.services.tuning_service.make_session", _mock_session_cm)
+        monkeypatch.setattr("app.services.training_service.make_session", _mock_session_cm)
+
+    def test_non_completed_trials_with_metrics_do_not_become_best_job(self, db_session, monkeypatch):
+        """Failed and timed-out/cancelled trials with high partial metrics cannot win best_job_id or early-stop."""
+        self._patch_make_session(monkeypatch, db_session)
+        model = _seed_model(db_session, "trial_eligibility_model")
+        ts = TuningSession(
+            model_id=model.id,
+            strategy=TuningStrategy.GRID,
+            search_space={"optimizer": ["adam", "sgd", "rmsprop"]},
+            max_trials=3,
+            metric="val_accuracy",
+            direction="maximize",
+            early_stop_threshold=0.95,
+            total_trials=3,
+            status=TuningSessionStatus.PENDING,
+        )
+        db_session.add(ts)
+        db_session.commit()
+        db_session.refresh(ts)
+
+        emitted = []
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService._emit_progress",
+            lambda _self, _loop, _sid, data: emitted.append(data),
+        )
+
+        trial_outcomes = [
+            (TrainingStatus.FAILED, 0.99),
+            (TrainingStatus.CANCELLED, 0.98),
+            (TrainingStatus.COMPLETED, 0.82),
+        ]
+        created_jobs = []
+
+        def _fake_trial(_self, session_id, _model_name, hp, trial_num, _loop):
+            status, metric_val = trial_outcomes[trial_num]
+            job = _seed_job(
+                db_session,
+                model.id,
+                status,
+                hyperparams=hp,
+                tuning_session_id=session_id,
+            )
+            db_session.add(TrainingMetric(job_id=job.id, epoch=1, metric_name="val_accuracy", metric_value=metric_val))
+            db_session.commit()
+            created_jobs.append(job.id)
+            return job.id
+
+        monkeypatch.setattr("app.services.tuning_service.TuningService._run_single_trial", _fake_trial)
+
+        TuningService().run_tuning_loop(ts.id, model.model_name, loop=None)
+
+        db_session.refresh(ts)
+        assert ts.status == TuningSessionStatus.COMPLETED
+        assert ts.completed_trials == 3
+        assert ts.early_stopped is False
+        assert ts.best_job_id == created_jobs[2]
+
+        terminal = [e for e in emitted if e.get("type") == "tuning_complete"]
+        assert len(terminal) == 1
+        assert terminal[0]["best_job_id"] == created_jobs[2]
+        assert terminal[0]["best_metric"] == 0.82
+
+    def test_all_non_completed_trials_leave_best_job_id_none(self, db_session, monkeypatch):
+        """If every trial fails or times out, best_job_id and best_metric remain None."""
+        self._patch_make_session(monkeypatch, db_session)
+        model = _seed_model(db_session, "all_failed_trials_model")
+        ts = TuningSession(
+            model_id=model.id,
+            strategy=TuningStrategy.GRID,
+            search_space={"optimizer": ["adam", "sgd"]},
+            max_trials=2,
+            metric="val_accuracy",
+            direction="maximize",
+            total_trials=2,
+            status=TuningSessionStatus.PENDING,
+        )
+        db_session.add(ts)
+        db_session.commit()
+        db_session.refresh(ts)
+
+        emitted = []
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService._emit_progress",
+            lambda _self, _loop, _sid, data: emitted.append(data),
+        )
+
+        def _fake_trial(_self, session_id, _model_name, hp, trial_num, _loop):
+            status = TrainingStatus.FAILED if trial_num == 0 else TrainingStatus.CANCELLED
+            job = _seed_job(db_session, model.id, status, hyperparams=hp, tuning_session_id=session_id)
+            db_session.add(TrainingMetric(job_id=job.id, epoch=1, metric_name="val_accuracy", metric_value=0.91))
+            db_session.commit()
+            return job.id
+
+        monkeypatch.setattr("app.services.tuning_service.TuningService._run_single_trial", _fake_trial)
+
+        TuningService().run_tuning_loop(ts.id, model.model_name, loop=None)
+
+        db_session.refresh(ts)
+        assert ts.status == TuningSessionStatus.COMPLETED
+        assert ts.completed_trials == 2
+        assert ts.best_job_id is None
+
+        terminal = [e for e in emitted if e.get("type") == "tuning_complete"]
+        assert len(terminal) == 1
+        assert terminal[0]["best_job_id"] is None
+        assert terminal[0]["best_metric"] is None
+
+    @pytest.mark.parametrize(
+        "job_status",
+        [TrainingStatus.FAILED, TrainingStatus.CANCELLED, TrainingStatus.RUNNING, TrainingStatus.PENDING],
+    )
+    def test_apply_best_rejects_non_completed_best_job(self, client, db_session, monkeypatch, job_status):
+        """POST apply-best returns 400 and leaves ModelBasic untouched if best_job is not COMPLETED."""
+        self._patch_make_session(monkeypatch, db_session)
+        model = _seed_model(db_session, f"apply_reject_{job_status.value}")
+        bad_job = _seed_job(
+            db_session,
+            model.id,
+            job_status,
+            hyperparams={"optimizer": "sgd", "epochs": 99, "batch_size": 128},
+        )
+        ts = _seed_tuning_session(
+            db_session,
+            model.id,
+            status=TuningSessionStatus.COMPLETED,
+            best_job_id=bad_job.id,
+        )
+
+        resp = client.post(f"{BASE}/tuning/{ts.id}/apply-best")
+        assert resp.status_code == 400
+        assert "not completed" in resp.json()["message"].lower()
+
+        db_session.refresh(model)
+        assert model.optimizer == "adam"
+        assert model.epochs == 5
+        assert model.batch_size == 32
+
+    @pytest.mark.parametrize(
+        ("initial_status", "initial_error"),
+        [
+            (TrainingStatus.COMPLETED, None),
+            (TrainingStatus.FAILED, "OOM error"),
+            (TrainingStatus.CANCELLED, "Tuning session cancelled by user"),
+        ],
+    )
+    def test_timeout_trial_preserves_terminal_job_states(self, db_session, monkeypatch, initial_status, initial_error):
+        """_timeout_trial never overwrites COMPLETED, FAILED, or already-CANCELLED jobs."""
+        self._patch_make_session(monkeypatch, db_session)
+        model = _seed_model(db_session, f"timeout_guard_{initial_status.value}")
+        original_completed_at = datetime(2026, 2, 1, 10, 30, 0, tzinfo=UTC)
+        job = TrainingJob(
+            model_id=model.id,
+            status=initial_status,
+            error_message=initial_error,
+            completed_at=original_completed_at,
+        )
+        db_session.add(job)
+        db_session.commit()
+        db_session.refresh(job)
+
+        TuningService()._timeout_trial(job.id)
+
+        db_session.refresh(job)
+        assert job.status == initial_status
+        assert job.error_message == initial_error
+        assert job.completed_at.replace(tzinfo=None) == original_completed_at.replace(tzinfo=None)
+
+    def test_timeout_not_overwritten_when_run_single_trial_catches_exception(self, db_session, monkeypatch):
+        """If _timeout_trial marks CANCELLED before model_run raises, _run_single_trial preserves CANCELLED."""
+        self._patch_make_session(monkeypatch, db_session)
+        model = _seed_model(db_session, "timeout_then_error_model")
+        ts = _seed_tuning_session(db_session, model.id, status=TuningSessionStatus.RUNNING)
+        svc = TuningService()
+
+        def _slow_failing_run(_model_name, _session, loop=None, job_id=None):
+            svc._timeout_trial(job_id)
+            raise RuntimeError("halted after timeout")
+
+        monkeypatch.setattr("app.services.model_run.model_run", _slow_failing_run)
+
+        job_id = svc._run_single_trial(ts.id, model.model_name, {"optimizer": "sgd"}, trial_num=0, loop=None)
+        job = db_session.get(TrainingJob, job_id)
+        assert job is not None
+        assert job.status == TrainingStatus.CANCELLED
+        assert job.error_message == "Trial timeout exceeded"
+
+    def test_metric_fallback_consistent_across_service_api_and_socketio(self, client, db_session, monkeypatch):
+        """Metric val_ fallback resolves identically in service, API GET/DELETE, and Socket.IO catch-up."""
+        import app.socketio_instance as si
+        from app.services.tuning_service import resolve_trial_metric
+
+        self._patch_make_session(monkeypatch, db_session)
+        model = _seed_model(db_session, "metric_fallback_model")
+
+        ts = TuningSession(
+            model_id=model.id,
+            strategy=TuningStrategy.GRID,
+            search_space={"optimizer": ["adam", "sgd"]},
+            max_trials=2,
+            metric="val_accuracy",
+            direction="maximize",
+            status=TuningSessionStatus.RUNNING,
+        )
+        db_session.add(ts)
+        db_session.commit()
+        db_session.refresh(ts)
+
+        completed_job = _seed_job(
+            db_session,
+            model.id,
+            TrainingStatus.COMPLETED,
+            hyperparams={"optimizer": "adam"},
+            tuning_session_id=ts.id,
+        )
+        failed_job = _seed_job(
+            db_session,
+            model.id,
+            TrainingStatus.FAILED,
+            hyperparams={"optimizer": "sgd"},
+            tuning_session_id=ts.id,
+        )
+        # Only unprefixed "accuracy" was logged (no "val_accuracy"), plus reverse "val_loss" for "loss".
+        db_session.add(TrainingMetric(job_id=completed_job.id, epoch=1, metric_name="accuracy", metric_value=0.87))
+        db_session.add(TrainingMetric(job_id=completed_job.id, epoch=1, metric_name="val_loss", metric_value=0.25))
+        db_session.add(TrainingMetric(job_id=failed_job.id, epoch=1, metric_name="accuracy", metric_value=0.99))
+
+        ts.best_job_id = completed_job.id
+        db_session.add(ts)
+        db_session.commit()
+
+        # 1. Service lookup (both val_->unprefixed and unprefixed->val_ directions)
+        svc = TuningService()
+        assert svc._get_trial_metric(completed_job.id, "val_accuracy") == 0.87
+        assert resolve_trial_metric(db_session, completed_job.id, "loss") == 0.25
+
+        # 2. API GET /model/tuning/{tuning_id}
+        resp = client.get(f"{BASE}/tuning/{ts.id}")
+        assert resp.status_code == 200
+        by_id = {t["job_id"]: t for t in resp.json()["data"]["trials"]}
+        assert by_id[completed_job.id]["metric_value"] == 0.87
+        assert by_id[failed_job.id]["metric_value"] is None
+
+        # 3. Socket.IO _load_tuning_catchup
+        catchup = si._load_tuning_catchup(ts.id)
+        assert catchup is not None
+        catchup_by_id = {t["job_id"]: t for t in catchup["trials"]}
+        assert catchup_by_id[completed_job.id]["metric_value"] == 0.87
+        assert catchup_by_id[failed_job.id]["metric_value"] is None
+
+        # 4. API DELETE /model/tuning/{tuning_id} cancellation emit preserves fallback best_metric
+        with patch("app.socketio_instance.sio.emit", new_callable=AsyncMock) as mock_sio_emit:
+            del_resp = client.delete(f"{BASE}/tuning/{ts.id}")
+        assert del_resp.status_code == 204
+        mock_sio_emit.assert_awaited_once()
+        payload = mock_sio_emit.call_args[0][1]
+        assert payload["best_job_id"] == completed_job.id
+        assert payload["best_metric"] == 0.87
+
+    def test_non_finite_metrics_ignored_in_selection_and_endpoints(self, client, db_session, monkeypatch):
+        """NaN and Inf metrics are ignored everywhere and never poison best_metric or JSON serialization."""
+        import app.socketio_instance as si
+        from app.services.tuning_service import resolve_trial_metric
+
+        self._patch_make_session(monkeypatch, db_session)
+        model = _seed_model(db_session, "non_finite_metric_model")
+
+        # Part A: resolve_trial_metric, GET endpoint, and Socket.IO catch-up ignore +/-inf.
+        ts = TuningSession(
+            model_id=model.id,
+            strategy=TuningStrategy.GRID,
+            search_space={"optimizer": ["adam", "sgd", "rmsprop"]},
+            max_trials=3,
+            metric="val_accuracy",
+            direction="maximize",
+            total_trials=3,
+            status=TuningSessionStatus.PENDING,
+        )
+        db_session.add(ts)
+        db_session.commit()
+        db_session.refresh(ts)
+
+        inf_job = _seed_job(db_session, model.id, TrainingStatus.COMPLETED, tuning_session_id=ts.id)
+        neg_inf_job = _seed_job(db_session, model.id, TrainingStatus.COMPLETED, tuning_session_id=ts.id)
+        finite_job = _seed_job(db_session, model.id, TrainingStatus.COMPLETED, tuning_session_id=ts.id)
+        db_session.add(
+            TrainingMetric(job_id=inf_job.id, epoch=1, metric_name="val_accuracy", metric_value=float("inf"))
+        )
+        db_session.add(
+            TrainingMetric(job_id=neg_inf_job.id, epoch=1, metric_name="accuracy", metric_value=float("-inf"))
+        )
+        db_session.add(TrainingMetric(job_id=finite_job.id, epoch=1, metric_name="val_accuracy", metric_value=0.76))
+        db_session.commit()
+
+        assert resolve_trial_metric(db_session, inf_job.id, "val_accuracy") is None
+        assert resolve_trial_metric(db_session, neg_inf_job.id, "val_accuracy") is None
+        assert resolve_trial_metric(db_session, finite_job.id, "val_accuracy") == 0.76
+
+        # Part B: run_tuning_loop ignores mocked NaN (trial 0) and DB Inf (trial 1), picking finite trial 2.
+        emitted = []
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService._emit_progress",
+            lambda _self, _loop, _sid, data: emitted.append(data),
+        )
+        trial_jobs = [inf_job.id, neg_inf_job.id, finite_job.id]
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService._run_single_trial",
+            lambda _self, _sid, _m, _hp, trial_num, _loop: trial_jobs[trial_num],
+        )
+        original_get_metric = TuningService._get_trial_metric
+
+        def _get_metric_with_nan(self_svc, jid, mname):
+            if jid == inf_job.id:
+                return float("nan")
+            return original_get_metric(self_svc, jid, mname)
+
+        monkeypatch.setattr("app.services.tuning_service.TuningService._get_trial_metric", _get_metric_with_nan)
+
+        TuningService().run_tuning_loop(ts.id, model.model_name, loop=None)
+
+        db_session.refresh(ts)
+        assert ts.status == TuningSessionStatus.COMPLETED
+        assert ts.best_job_id == finite_job.id
+
+        terminal = [e for e in emitted if e.get("type") == "tuning_complete"]
+        assert len(terminal) == 1
+        assert terminal[0]["best_job_id"] == finite_job.id
+        assert terminal[0]["best_metric"] == 0.76
+
+        # GET and catch-up both serialize cleanly with None for +/-inf trials.
+        resp = client.get(f"{BASE}/tuning/{ts.id}")
+        assert resp.status_code == 200
+        by_id = {t["job_id"]: t for t in resp.json()["data"]["trials"]}
+        assert by_id[inf_job.id]["metric_value"] is None
+        assert by_id[neg_inf_job.id]["metric_value"] is None
+        assert by_id[finite_job.id]["metric_value"] == 0.76
+
+        catchup = si._load_tuning_catchup(ts.id)
+        assert catchup is not None
+        catchup_by_id = {t["job_id"]: t for t in catchup["trials"]}
+        assert catchup_by_id[inf_job.id]["metric_value"] is None
+        assert catchup_by_id[neg_inf_job.id]["metric_value"] is None
+        assert catchup_by_id[finite_job.id]["metric_value"] == 0.76
+
+
+class TestStageCFailureRecovery:
+    """Stage C regression tests for outer exception recovery in run_tuning_loop."""
+
+    @staticmethod
+    def _patch_make_session(monkeypatch, db_session):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _mock_session_cm():
+            yield db_session
+
+        monkeypatch.setattr("app.services.tuning_service.make_session", _mock_session_cm)
+
+    def test_unexpected_exception_in_run_tuning_loop_fails_session_and_releases_slot(self, db_session, monkeypatch):
+        """An unexpected error outside validation/trial handlers marks the session FAILED and frees the slot."""
+        self._patch_make_session(monkeypatch, db_session)
+        monkeypatch.setattr("app.services.tuning_service.MAX_CONCURRENT_TUNING_SESSIONS", 1)
+
+        model = _seed_model(db_session, "unexpected_error_model")
+        ts = TuningSession(
+            model_id=model.id,
+            strategy=TuningStrategy.GRID,
+            search_space={"optimizer": ["adam", "sgd"]},
+            max_trials=2,
+            metric="val_accuracy",
+            direction="maximize",
+            total_trials=2,
+            status=TuningSessionStatus.PENDING,
+        )
+        db_session.add(ts)
+        db_session.commit()
+        db_session.refresh(ts)
+
+        emitted = []
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService._emit_progress",
+            lambda _self, _loop, _sid, data: emitted.append(data),
+        )
+
+        # Fail in generate_grid_combinations: after validate_search_space and outside _run_single_trial.
+        def _explode(_self, _search_space):
+            raise RuntimeError("Unexpected grid generation failure")
+
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService.generate_grid_combinations",
+            _explode,
+        )
+
+        TuningService().run_tuning_loop(ts.id, model.model_name, loop=None)
+
+        db_session.refresh(ts)
+        assert ts.status == TuningSessionStatus.FAILED
+        assert ts.completed_at is not None
+
+        terminal = [e for e in emitted if e.get("type") == "tuning_complete"]
+        assert len(terminal) == 1
+        assert terminal[0]["status"] == "failed"
+        assert "Unexpected grid generation failure" in (terminal[0]["error"] or "")
+
+        # With MAX_CONCURRENT_TUNING_SESSIONS=1, the failed session must not consume the slot.
+        check_tuning_concurrency_limit(db_session)
+
+    def test_unexpected_exception_preserves_cancelled_and_completed_without_duplicate_complete(
+        self, db_session, monkeypatch
+    ):
+        """Unexpected errors after CANCELLED or COMPLETED do not overwrite state or re-emit tuning_complete."""
+        self._patch_make_session(monkeypatch, db_session)
+        model = _seed_model(db_session, "unexpected_terminal_guard_model")
+
+        # Case 1: Cancelled concurrently while generating trials before raising.
+        cancelled_at = datetime(2026, 3, 1, 9, 0, 0, tzinfo=UTC)
+        ts_cancelled = TuningSession(
+            model_id=model.id,
+            strategy=TuningStrategy.GRID,
+            search_space={"optimizer": ["adam", "sgd"]},
+            max_trials=2,
+            metric="val_accuracy",
+            direction="maximize",
+            status=TuningSessionStatus.PENDING,
+        )
+        db_session.add(ts_cancelled)
+        db_session.commit()
+        db_session.refresh(ts_cancelled)
+
+        emitted = []
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService._emit_progress",
+            lambda _self, _loop, _sid, data: emitted.append(data),
+        )
+
+        def _cancel_then_explode(_self, _search_space):
+            ts_row = db_session.get(TuningSession, ts_cancelled.id)
+            ts_row.status = TuningSessionStatus.CANCELLED
+            ts_row.completed_at = cancelled_at
+            db_session.add(ts_row)
+            db_session.commit()
+            raise RuntimeError("Late unexpected error after cancellation")
+
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService.generate_grid_combinations",
+            _cancel_then_explode,
+        )
+
+        TuningService().run_tuning_loop(ts_cancelled.id, model.model_name, loop=None)
+
+        db_session.refresh(ts_cancelled)
+        assert ts_cancelled.status == TuningSessionStatus.CANCELLED
+        assert ts_cancelled.completed_at.replace(tzinfo=None) == cancelled_at.replace(tzinfo=None)
+        assert [e for e in emitted if e.get("type") == "tuning_complete"] == []
+
+        # Case 2: Outer _emit_progress after RUNNING -> COMPLETED raises unexpectedly; COMPLETED stays intact.
+        ts_completed = TuningSession(
+            model_id=model.id,
+            strategy=TuningStrategy.GRID,
+            search_space={"optimizer": ["adam"]},
+            max_trials=1,
+            metric="val_accuracy",
+            direction="maximize",
+            status=TuningSessionStatus.PENDING,
+        )
+        db_session.add(ts_completed)
+        db_session.commit()
+        db_session.refresh(ts_completed)
+
+        monkeypatch.setattr(
+            "app.services.tuning_service.TuningService.generate_grid_combinations",
+            lambda _self, _ss: [{"optimizer": "adam"}],
+        )
+
+        def _fake_trial(_self, session_id, _model_name, hp, _trial_num, _loop):
+            job = _seed_job(
+                db_session,
+                model.id,
+                TrainingStatus.COMPLETED,
+                hyperparams=hp,
+                tuning_session_id=session_id,
+            )
+            db_session.add(TrainingMetric(job_id=job.id, epoch=1, metric_name="val_accuracy", metric_value=0.9))
+            db_session.commit()
+            return job.id
+
+        monkeypatch.setattr("app.services.tuning_service.TuningService._run_single_trial", _fake_trial)
+
+        complete_emits = []
+
+        def _raise_on_complete(_self, _loop, _sid, data):
+            if data.get("type") == "tuning_complete":
+                complete_emits.append(data)
+                raise RuntimeError("Socket transport failure")
+
+        monkeypatch.setattr("app.services.tuning_service.TuningService._emit_progress", _raise_on_complete)
+
+        TuningService().run_tuning_loop(ts_completed.id, model.model_name, loop=None)
+
+        db_session.refresh(ts_completed)
+        assert ts_completed.status == TuningSessionStatus.COMPLETED
+        assert len(complete_emits) == 1
+        assert complete_emits[0]["status"] == "completed"
